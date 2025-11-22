@@ -1,3 +1,4 @@
+
 import express from "express"
 import cors from "cors"
 import pg from "pg"
@@ -411,7 +412,73 @@ app.post("/api/invoices/upload", upload.single("file"), async (req, res) => {
       `INSERT INTO invoices (status, fileUrl) VALUES ($1, $2) RETURNING *`,
       ["Uploaded", fileUrl],
     )
-    res.json(r.rows[0])
+    const extracted = await (async () => {
+      const invRes = await pool.query("SELECT * FROM invoices WHERE id = $1", [r.rows[0].id])
+      const inv = invRes.rows[0]
+      const normalizeDate = (s) => {
+        if (!s) return null
+        const m = s.match(/^([0-9]{1,2})[\/\-]([0-9]{1,2})[\/\-]([0-9]{2,4})$/)
+        if (m) {
+          const y = m[3].length === 2 ? `20${m[3]}` : m[3]
+          return `${y}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`
+        }
+        const d = new Date(s)
+        return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10)
+      }
+      const mapFromOcr = (ocr) => ({
+        invoiceNumber: ocr["Invoice Number"] || null,
+        supplier: ocr["Vendor Name"] || null,
+        date: normalizeDate(ocr["Invoice Date"]) || null,
+        totalAmount: ocr["Total Amount"] ? Number(ocr["Total Amount"]) : null,
+        items: Array.isArray(ocr["Items"]) ? ocr["Items"].map((x) => ({
+          productName: x["Item Name"] || null,
+          sku: x["HSN/SAC Code"] || null,
+          quantity: x["Quantity"] ? Number(String(x["Quantity"]).replace(/,/g, "")) : 0,
+          unitPrice: x["Unit Price"] ? Number(String(x["Unit Price"]).replace(/,/g, "")) : null,
+          total: x["Line Total"] ? Number(String(x["Line Total"]).replace(/,/g, "")) : null,
+        })) : [],
+      })
+      const filename = inv.fileurl && path.basename(inv.fileurl)
+      const filePath = path.join(path.join(process.cwd(), "backend", "storage"), "invoices", filename)
+      const pythonBin = process.env.PYTHON_BIN || "python"
+      const scriptPath = process.env.OCR_SCRIPT_PATH || path.join(process.cwd(), "ocr", "extract_invoice.py")
+      let out = ""
+      let errStr = ""
+      await new Promise((resolve, reject) => {
+        const proc = spawn(pythonBin, [scriptPath, filePath])
+        proc.stdout.on("data", (d) => (out += d.toString()))
+        proc.stderr.on("data", (d) => (errStr += d.toString()))
+        proc.on("close", (code) => (code === 0 ? resolve() : reject(new Error(errStr || `Python exit ${code}`))))
+      })
+      const ocr = JSON.parse(out)
+      const payload = mapFromOcr(ocr)
+      await pool.query("BEGIN")
+      await pool.query(
+        `UPDATE invoices SET invoiceNumber = $1, supplier = $2, date = $3, totalAmount = $4, status = $5 WHERE id = $6`,
+        [payload.invoiceNumber || null, payload.supplier || null, payload.date || null, payload.totalAmount || null, "Extracted", r.rows[0].id],
+      )
+      await pool.query("DELETE FROM invoiceItems WHERE invoiceId = $1", [r.rows[0].id])
+      for (const it of payload.items || []) {
+        let productId = null
+        if (it.sku) {
+          const p = await pool.query("SELECT id FROM products WHERE sku = $1", [it.sku])
+          if (p.rows[0]) productId = p.rows[0].id
+        }
+        if (!productId && it.productName) {
+          const p = await pool.query("SELECT id FROM products WHERE LOWER(name) = LOWER($1) LIMIT 1", [it.productName])
+          if (p.rows[0]) productId = p.rows[0].id
+        }
+        await pool.query(
+          `INSERT INTO invoiceItems (invoiceId, productId, productName, sku, quantity, unitPrice, total)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [r.rows[0].id, productId, it.productName || null, it.sku || null, it.quantity || 0, it.unitPrice || null, it.total || null],
+        )
+      }
+      await pool.query("COMMIT")
+      const refreshed = await pool.query("SELECT * FROM invoices WHERE id = $1", [r.rows[0].id])
+      return refreshed.rows[0]
+    })()
+    res.json(extracted)
   } catch (err) {
     res.status(400).json({ error: err.message })
   }
